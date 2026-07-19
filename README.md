@@ -9,8 +9,9 @@ ring looks abnormal — that is the entire design of the crime. Untangle models 
 payment system as one graph and asks a different question: *who is this account
 moving money with, and does that pattern look coordinated?*
 
-**Status: Day 1–2 complete.** Synthetic world, feature extraction, two baselines,
-and the evaluation harness are built and benchmarked. The graph model is next.
+**Status: Day 1–3 complete.** Synthetic world, feature extraction, baselines,
+evaluation harness, and the graph models (GraphSAGE + GAT) are built and
+benchmarked. Ring extraction, the API and the visualiser are next.
 
 ---
 
@@ -44,7 +45,19 @@ sub-threshold hops over a day; *smurf_wide* spreads it thin across many mules;
 *slow_layer* moves ordinary-looking amounts over nine days. A detector tuned to
 one tactic misses the others.
 
-**3. The graph is salted with hard negatives** — legitimate structures that
+**3. The population churns.** 12% of customers open their account *during* the
+observation window, activity is heavy-tailed, and 8% of accounts are legitimately
+dormant. Without this, every young sparse account in the world is a mule, and a
+graph model scores a perfect 1.000 by learning to spot recently-created nodes
+rather than by understanding laundering. (It did exactly that, once. See below.)
+
+**4. Mules are embedded in the ordinary economy.** They shop, they send peer
+transfers, and — critically — they *receive* peer transfers from ordinary people.
+A mule that only pays merchants shares no edge with any normal customer, which
+leaves its ring sitting in the graph as an isolated island that any clustering
+algorithm finds for free.
+
+**5. The graph is salted with hard negatives** — legitimate structures that
 reproduce a laundering signature exactly:
 
 | decoy | why it fools a rule engine |
@@ -61,37 +74,58 @@ caught by a single amount rule and proves nothing.
 
 ---
 
-## Results so far
+## Results
 
-40,210 accounts · 1.4M transactions · 26 rings · 1.5% mule prevalence.
+40,230 accounts · 1.15M transactions · 26 rings · 1.6% mule prevalence.
 Ring-disjoint split, threshold tuned on validation, scored on a held-out test set
-whose rings were never seen in training.
+of 7,988 accounts whose 5 rings were never seen in training.
 
-| model | precision | recall | F1 | PR-AUC | rings found | members recovered | P@100 |
-|---|---|---|---|---|---|---|---|
-| rule scorecard | 0.039 | 0.210 | 0.066 | 0.033 | 100% | 18% | 0.080 |
-| gradient boosting | 0.918 | 0.471 | 0.622 | 0.660 | 100% | 45% | 0.680 |
+| model | precision | recall | F1 | PR-AUC | rings found | members recovered | P@100 | alerts |
+|---|---|---|---|---|---|---|---|---|
+| rule scorecard | 0.048 | 0.210 | 0.078 | 0.040 | 100% | 24% | 0.080 | 693 |
+| gradient boosting | 0.763 | 0.452 | 0.568 | 0.637 | 100% | 49% | 0.730 | 93 |
+| MLP *(ablation)* | 0.683 | 0.535 | 0.600 | 0.637 | 100% | 58% | 0.750 | 123 |
+| **GraphSAGE** | **0.966** | **0.917** | **0.941** | **0.987** | 100% | **91%** | **1.000** | 149 |
+| GAT | 0.961 | 0.465 | 0.627 | 0.912 | 80% | 49% | 0.950 | 76 |
 
-The number that matters is not F1. It's this:
+The MLP row is the experiment, not filler. It is the same network, the same 30
+features, the same training budget — with message passing switched off. Two
+tests enforce that it is a real control: rewiring the graph must leave the MLP's
+predictions *identical* and must change GraphSAGE's.
 
-| | fresh mules | **rented mules** |
-|---|---|---|
-| rule scorecard | 0.05 | 0.26 |
-| gradient boosting | **1.00** | **0.18** |
+| | fresh mules | **rented mules** | ring members recovered |
+|---|---|---|---|
+| rule scorecard | 0.11 | 0.26 | 24% |
+| gradient boosting | 0.35 | 0.49 | 49% |
+| MLP (no message passing) | 0.67 | 0.44 | 58% |
+| **GraphSAGE** | **0.98** | **0.88** | **91%** |
 
-Gradient boosting catches *every single* disposable mule and **18% of the rented
-ones** — the half of the ring with clean profiles and real history. It recovers
-45% of the average ring's members, so the majority of every ring keeps operating.
+Rented mules — real accounts, years old, full KYC, genuine history, invisible on
+every profile feature — go from **0.44 to 0.88 recall** when the model is allowed
+to look at neighbours. Ring member recovery goes from 49% to 91%: the difference
+between alerting on half a laundering network and dismantling it.
 
-That gap is the thesis, stated as a measurement: the accounts a row-wise model
-cannot see are exactly the accounts that are only identifiable by who they
-transact with. Closing it is what the graph model has to do, and "beat 0.660
-PR-AUC / 45% member recovery" is the bar it will be held to.
+Nothing about the account changed. The only new information is who it transacts
+with. That is the entire thesis, measured.
 
-Note the rule scorecard's precision of 0.039 is not a strawman — it is what a
-threshold-based engine does at 1.5% prevalence against a graph seeded with
-legitimate look-alikes. It finds every ring but drowns the investigator in 644
-alerts to surface 25 mules.
+### Two honest caveats
+
+**GAT currently underperforms GraphSAGE and we have not fixed it.** Its *ranking*
+is fine (PR-AUC 0.912, ROC-AUC 0.998) but the F1-optimal threshold chosen on
+validation transfers badly to test, so it fires on only 76 accounts and recall
+collapses to 0.465. This is a threshold-selection problem, not a model failure —
+a fixed alert-budget cut-off (top-K, which is how banks actually staff
+investigations) would likely fix it. It is on the Day 4 list.
+
+**These numbers come from synthetic data with a known generative process,** so a
+graph model that recovers most of it is expected. The absolute PR-AUC is not the
+claim. The claim is the *ablation gap* — 0.637 → 0.987 on identical features —
+and the fact that the gap concentrates precisely on the accounts a row-wise model
+provably cannot see.
+
+The rule scorecard's 0.048 precision is not a strawman either. It is what a
+threshold engine does at 1.6% prevalence against a graph seeded with legitimate
+look-alikes: it finds every ring but buries the investigator in 693 alerts.
 
 ---
 
@@ -104,12 +138,13 @@ untangle/
   features.py   30 per-account features in 6 families
   splits.py     ring-disjoint train/val/test masks
   baseline.py   rule scorecard + gradient boosting
+  gnn.py        GraphSAGE, GAT and the no-message-passing ablation
   evaluate.py   node, ring and investigator-queue metrics
   cli.py        python -m untangle generate | bench
 ```
 
-Both baselines consume *exactly* the same feature table, so any lift the graph
-model shows comes from message passing and nothing else.
+Every model consumes *exactly* the same feature table, so any lift the graph
+models show comes from message passing and nothing else.
 
 ## Run it
 
@@ -119,18 +154,22 @@ pip install -r requirements.txt
 python -m untangle generate          # writes data/accounts.csv, data/transactions.csv
 python -m untangle bench             # generate, then score every detector
 python -m untangle --reuse bench     # re-score the data already on disk
+python -m untangle --no-gnn bench    # baselines only, seconds instead of minutes
 python -m untangle --accounts 8000 --rings 12 bench   # a quick one
 
 pytest tests -q
 ```
 
-Full pipeline on 40k accounts: ~9s to generate, ~2s to build features, a few
-seconds to benchmark.
+On 40k accounts: ~13s to generate, ~2.5s to build features, ~2s for the
+baselines. GraphSAGE trains in ~7 min on CPU and GAT in ~12; use `--no-gnn`
+while iterating on anything upstream of the models.
 
 ## Next
 
-- [ ] GraphSAGE + GAT over the transaction graph (hand-rolled in PyTorch — no
-      PyTorch Geometric install roulette)
+- [ ] Fix GAT's threshold transfer (fixed alert budget rather than F1-optimal)
 - [ ] Ring extraction: from scored nodes to a highlighted cluster
-- [ ] FastAPI scoring endpoint + reason codes
+- [ ] FastAPI scoring endpoint + reason codes from GAT attention
 - [ ] Force-directed live visualisation
+
+See [HANDOFF.md](HANDOFF.md) for the full build state, the invariants that keep
+the benchmark honest, and who owns what.

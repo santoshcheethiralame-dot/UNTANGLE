@@ -45,6 +45,7 @@ _ACCOUNT_COLS = [
     "ring_role",
     "ring_tactic",
     "decoy_type",
+    "joined_at_hours",
 ]
 
 _TX_COLS = ["tx_id", "src", "dst", "amount", "t_hours", "channel", "ring_id"]
@@ -77,6 +78,7 @@ class _World:
             "ring_role": "",
             "ring_tactic": "",
             "decoy_type": "",
+            "joined_at_hours": 0.0,
         }
         row.update(kw)
         self.accounts.append(row)
@@ -115,23 +117,34 @@ def _build_population(w: _World) -> dict:
     n_biz = int(n * cfg.business_frac)
     n_person = n - n_merch - n_biz
 
+    # who walks through the door mid-window rather than being there from t=0
+    is_newcomer = rng.random(n_person) < cfg.newcomer_frac
+
     for i in range(n):
         if i < n_person:
             kind = PERSONAL
-            age = int(np.clip(rng.gamma(4.0, 260.0), 20, 6000))
-            kyc = int(rng.choice([1, 2], p=[0.18, 0.82]))
+            if is_newcomer[i]:
+                # a brand-new customer: thin file, thin KYC, no history yet
+                joined = float(rng.uniform(0, w.horizon * 0.92))
+                age = max(1, int((w.horizon - joined) / 24.0))
+                kyc = int(rng.choice([0, 1, 2], p=[0.22, 0.48, 0.30]))
+            else:
+                joined = 0.0
+                age = int(np.clip(rng.gamma(4.0, 260.0), 20, 6000))
+                kyc = int(rng.choice([1, 2], p=[0.18, 0.82]))
         elif i < n_person + n_biz:
             kind = BUSINESS
             age = int(np.clip(rng.gamma(6.0, 300.0), 90, 8000))
-            kyc = 2
+            kyc, joined = 2, 0.0
         else:
             kind = MERCHANT
             age = int(np.clip(rng.gamma(5.0, 320.0), 60, 8000))
-            kyc = 2
+            kyc, joined = 2, 0.0
         w.add_account(
             kind=kind,
             age_days=age,
             kyc_level=kyc,
+            joined_at_hours=joined,
             device_id=i,  # honest accounts overwhelmingly own their device
             community=int(rng.integers(cfg.n_communities)),
             region=int(rng.integers(cfg.n_regions)),
@@ -151,12 +164,19 @@ def _build_population(w: _World) -> dict:
     rng.shuffle(pop)
     merchant_p = pop / pop.sum()
 
+    # How busy each customer is. Real activity is heavy-tailed and a meaningful
+    # slice of customers are simply dormant, which is what stops "few
+    # transactions" from being evidence of anything.
+    activity = rng.lognormal(0.0, cfg.activity_sigma, n_person)
+    activity[rng.random(n_person) < cfg.dormant_frac] *= 0.02
+
     return {
         "people": people,
         "businesses": businesses,
         "merchants": merchants,
         "merchant_p": merchant_p,
         "n_person": n_person,
+        "activity_p": activity / activity.sum(),
     }
 
 
@@ -186,7 +206,7 @@ def _legit_spend(w: _World, pop: dict):
     cfg, rng = w.cfg, w.rng
     people, merchants = pop["people"], pop["merchants"]
     n_tx = int(len(people) * cfg.n_days * cfg.spend_per_person_per_day)
-    src = rng.choice(people, size=n_tx)
+    src = rng.choice(people, size=n_tx, p=pop["activity_p"])
     dst = rng.choice(merchants, size=n_tx, p=pop["merchant_p"])
     amt = w.lognormal(cfg.spend_amount_median, 1.0, n_tx)
     # daytime-weighted timestamps
@@ -205,7 +225,7 @@ def _legit_p2p(w: _World, pop: dict):
     by_comm = {c: people[comm == c] for c in np.unique(comm)}
 
     n_tx = int(len(people) * cfg.n_days * cfg.p2p_per_person_per_day)
-    src = rng.choice(people, size=n_tx)
+    src = rng.choice(people, size=n_tx, p=pop["activity_p"])
     dst = np.empty(n_tx, dtype=np.int64)
     same = rng.random(n_tx) < 0.75
     for i, (s, keep_local) in enumerate(zip(src, same)):
@@ -329,18 +349,25 @@ def _decoy_remitter(w: _World, pop: dict):
 # ---------------------------------------------------------------------------
 
 
-def _claim_free_account(w: _World, pop: dict, rng, tries: int = 40) -> int | None:
-    """An ordinary personal account not already spoken for by a ring or a decoy."""
+def _claim_free_account(w: _World, pop: dict, rng, before: float, tries: int = 40):
+    """An ordinary personal account not already spoken for by a ring or a decoy,
+    and already open by time `before` -- a ring cannot recruit an account that
+    does not exist yet."""
     for _ in range(tries):
         cand = int(rng.choice(pop["people"]))
         acct = w.accounts[cand]
-        if acct["is_mule"] == 0 and acct["ring_id"] == -1 and acct["decoy_type"] == "":
+        if (
+            acct["is_mule"] == 0
+            and acct["ring_id"] == -1
+            and acct["decoy_type"] == ""
+            and acct["joined_at_hours"] <= before
+        ):
             return cand
     return None
 
 
 def _spawn_mules(
-    w: _World, pop: dict, k: int, ring_id: int, tactic: str, n_devices: int
+    w: _World, pop: dict, k: int, ring_id: int, tactic: str, n_devices: int, t0: float
 ) -> list[int]:
     """Recruit a ring's mules from two very different sources.
 
@@ -363,14 +390,18 @@ def _spawn_mules(
         # Not all "fresh" mules are new. A good recruiter keeps a stock of shell
         # accounts opened months or years earlier precisely so that an
         # account-age rule sees nothing unusual on the day they are switched on.
+        # Either way the account must exist before the ring starts moving money.
         if rng.random() < 0.4:
             age = int(np.clip(rng.gamma(5.0, 160.0), 240, 3000))
+            joined = 0.0
         else:
-            age = int(np.clip(rng.gamma(2.0, 18.0), 3, 240))
+            joined = float(max(0.0, t0 - rng.uniform(24.0, 30 * 24.0)))
+            age = max(1, int((w.horizon - joined) / 24.0))
         mules.append(
             w.add_account(
                 kind=PERSONAL,
                 age_days=age,
+                joined_at_hours=joined,
                 kyc_level=int(rng.choice([0, 1, 2], p=[0.35, 0.5, 0.15])),
                 device_id=int(rng.choice(devices)),
                 community=int(rng.integers(w.cfg.n_communities)),
@@ -383,7 +414,7 @@ def _spawn_mules(
         )
 
     for _ in range(k - n_fresh):
-        cand = _claim_free_account(w, pop, rng)
+        cand = _claim_free_account(w, pop, rng, before=t0)
         if cand is None:
             continue
         w.accounts[cand].update(is_mule=1, ring_id=ring_id, ring_role="mule_rented",
@@ -406,6 +437,33 @@ def _ring_amounts(w: _World, tactic: str, k: int, pot: float) -> np.ndarray:
     return w.lognormal(pot / k, 0.5, k)
 
 
+def _ordinary_life(w: _World, pop: dict, acct: int) -> None:
+    """Give one account the everyday traffic a customer of its tenure would have:
+    shopping, peer transfers out, and peer transfers in from ordinary people.
+
+    The last of those is the important one. A mule that only ever pays merchants
+    shares no edge with any normal customer, which makes its ring trivially
+    separable as an isolated component. Real mules are embedded in the ordinary
+    economy -- that embedding is exactly what makes them hard to find.
+    """
+    cfg, rng = w.cfg, w.rng
+    joined = w.accounts[acct]["joined_at_hours"]
+    live_days = max(1.0, (w.horizon - joined) / 24.0)
+    when = lambda: float(rng.uniform(joined, w.horizon))  # noqa: E731
+
+    for _ in range(rng.poisson(cfg.spend_per_person_per_day * live_days)):
+        d = int(rng.choice(pop["merchants"], p=pop["merchant_p"]))
+        w.add_tx(acct, d, float(w.lognormal(cfg.spend_amount_median, 1.0)), when(), "UPI")
+
+    for _ in range(rng.poisson(cfg.p2p_per_person_per_day * live_days)):
+        peer = int(rng.choice(pop["people"], p=pop["activity_p"]))
+        w.add_tx(acct, peer, float(w.lognormal(cfg.p2p_amount_median, 1.15)), when(), "UPI")
+
+    for _ in range(rng.poisson(cfg.p2p_per_person_per_day * live_days)):
+        peer = int(rng.choice(pop["people"], p=pop["activity_p"]))
+        w.add_tx(peer, acct, float(w.lognormal(cfg.p2p_amount_median, 1.15)), when(), "UPI")
+
+
 def _inject_ring(w: _World, pop: dict, ring_id: int) -> None:
     cfg, rng = w.cfg, w.rng
     tactic = str(rng.choice(RING_TACTICS, p=cfg.tactic_weights))
@@ -415,7 +473,12 @@ def _inject_ring(w: _World, pop: dict, ring_id: int) -> None:
     # must be unclaimed. Reusing an account that already belongs to another ring
     # would overwrite its ring_id, which quietly moves a mule into a different
     # split and leaks structure across the train/test boundary.
-    victim = _claim_free_account(w, pop, rng)
+    pot = float(w.lognormal(cfg.pot_median, 0.8))
+    # how long the whole operation takes -- this is the other axis rules key on
+    span = {"structuring": 30.0, "smurf_wide": 48.0, "slow_layer": 9 * 24.0}[tactic]
+    t0 = rng.uniform(0, max(1.0, w.horizon - span - 4.0))
+
+    victim = _claim_free_account(w, pop, rng, before=t0)
     if victim is None:
         return
     w.accounts[victim]["ring_role"] = "source"
@@ -424,14 +487,9 @@ def _inject_ring(w: _World, pop: dict, ring_id: int) -> None:
     # Handset reuse is real but far from one-phone-per-ring: operators know
     # device fingerprinting exists, so most mules get their own.
     n_devices = max(2, int(k * rng.uniform(0.45, 0.9)))
-    mules = _spawn_mules(w, pop, k, ring_id, tactic, n_devices)
+    mules = _spawn_mules(w, pop, k, ring_id, tactic, n_devices, t0)
     collector = mules[int(rng.integers(len(mules)))]
     w.accounts[collector]["ring_role"] = "collector"
-
-    pot = float(w.lognormal(cfg.pot_median, 0.8))
-    # how long the whole operation takes -- this is the other axis rules key on
-    span = {"structuring": 30.0, "smurf_wide": 48.0, "slow_layer": 9 * 24.0}[tactic]
-    t0 = rng.uniform(0, max(1.0, w.horizon - span - 4.0))
 
     # 1. placement: source fans the pot out to the mules
     amts = _ring_amounts(w, tactic, k, pot)
@@ -464,14 +522,13 @@ def _inject_ring(w: _World, pop: dict, ring_id: int) -> None:
     w.add_tx(collector, exit_point, pot * rng.uniform(0.75, 0.9),
              t0 + span * 0.98, "IMPS", ring_id)
 
-    # 4. cover traffic: some mules behave like ordinary customers too
+    # 4. cover traffic: the mules live ordinary lives around the laundering.
+    #    This is what stops a fresh mule from being a beacon -- without it they
+    #    only ever touch each other and the model detects ring membership by
+    #    spotting an isolated cluster rather than by understanding the flows.
     for m in mules:
-        if rng.random() > cfg.mule_cover_traffic:
-            continue
-        for _ in range(int(rng.integers(2, 9))):
-            d = int(rng.choice(pop["merchants"], p=pop["merchant_p"]))
-            a = float(w.lognormal(cfg.spend_amount_median, 1.0))
-            w.add_tx(m, d, a, rng.uniform(0, w.horizon), "UPI")
+        if rng.random() <= cfg.mule_cover_traffic:
+            _ordinary_life(w, pop, m)
 
 
 # ---------------------------------------------------------------------------
@@ -502,7 +559,19 @@ def generate(cfg: GraphConfig | None = None) -> tuple[pd.DataFrame, pd.DataFrame
         _inject_ring(w, pop, ring_id)
 
     accounts = pd.DataFrame(w.accounts, columns=_ACCOUNT_COLS)
-    tx = pd.DataFrame(w.tx, columns=_TX_COLS).sort_values("t_hours", ignore_index=True)
+    tx = pd.DataFrame(w.tx, columns=_TX_COLS)
+
+    # An account cannot transact before it is opened. Applying this after the
+    # fact is what gives newcomers their thin, recent transaction history --
+    # and it is why "few counterparties, short span, young account" describes
+    # thousands of ordinary customers rather than only mules.
+    joined = accounts["joined_at_hours"].to_numpy()
+    alive = (tx["t_hours"].to_numpy() >= joined[tx["src"].to_numpy()]) & (
+        tx["t_hours"].to_numpy() >= joined[tx["dst"].to_numpy()]
+    )
+    dropped_ring = int((~alive & (tx["ring_id"] >= 0)).sum())
+    assert dropped_ring == 0, f"{dropped_ring} ring transfers precede an account's opening"
+    tx = tx[alive].sort_values("t_hours", ignore_index=True)
     tx["tx_id"] = np.arange(len(tx))
 
     # device reuse is a feature, not a lookup -- compute it once here

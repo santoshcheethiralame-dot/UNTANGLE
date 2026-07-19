@@ -19,6 +19,14 @@ class GraphConfig:
     business_frac: float = 0.055
     n_communities: int = 60
     n_regions: int = 12
+    # Share of customers who open their account *during* the observation window.
+    # Without these, every young sparse account in the world is a mule and the
+    # graph model just learns to spot freshly-created nodes.
+    newcomer_frac: float = 0.12
+    # Legitimately inactive customers. They give the world old accounts with
+    # almost no traffic, so "dormant" is not a synonym for "shell company".
+    dormant_frac: float = 0.08
+    activity_sigma: float = 0.8  # spread of the per-customer activity multiplier
 
     # --- legitimate traffic volume ---
     p2p_per_person_per_day: float = 0.22
