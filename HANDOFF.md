@@ -114,9 +114,12 @@ Both expose the same interface, and **the GNN must implement it too**:
 ```python
 class Model:
     name: str
-    def fit(self, X: pd.DataFrame, y: np.ndarray, mask: np.ndarray) -> "Model": ...
-    def score(self, X: pd.DataFrame) -> np.ndarray:  # one score per account, all N
+    def fit(self, X, y, mask, val_mask=None) -> "Model": ...
+    def score(self, X) -> np.ndarray:  # one score per account, all N
 ```
+
+`val_mask` is optional and ignored by both baselines; the GNN uses it for early
+stopping. Any new model must accept it even if it does nothing with it.
 
 ### `evaluate.py`
 

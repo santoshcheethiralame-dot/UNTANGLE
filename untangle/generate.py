@@ -329,6 +329,16 @@ def _decoy_remitter(w: _World, pop: dict):
 # ---------------------------------------------------------------------------
 
 
+def _claim_free_account(w: _World, pop: dict, rng, tries: int = 40) -> int | None:
+    """An ordinary personal account not already spoken for by a ring or a decoy."""
+    for _ in range(tries):
+        cand = int(rng.choice(pop["people"]))
+        acct = w.accounts[cand]
+        if acct["is_mule"] == 0 and acct["ring_id"] == -1 and acct["decoy_type"] == "":
+            return cand
+    return None
+
+
 def _spawn_mules(
     w: _World, pop: dict, k: int, ring_id: int, tactic: str, n_devices: int
 ) -> list[int]:
@@ -373,14 +383,12 @@ def _spawn_mules(
         )
 
     for _ in range(k - n_fresh):
-        for _attempt in range(20):
-            cand = int(rng.choice(pop["people"]))
-            acct = w.accounts[cand]
-            if acct["is_mule"] == 0 and acct["ring_id"] == -1 and acct["decoy_type"] == "":
-                acct.update(is_mule=1, ring_id=ring_id, ring_role="mule_rented",
-                            ring_tactic=tactic)
-                mules.append(cand)
-                break
+        cand = _claim_free_account(w, pop, rng)
+        if cand is None:
+            continue
+        w.accounts[cand].update(is_mule=1, ring_id=ring_id, ring_role="mule_rented",
+                                ring_tactic=tactic)
+        mules.append(cand)
     return mules
 
 
@@ -403,8 +411,13 @@ def _inject_ring(w: _World, pop: dict, ring_id: int) -> None:
     tactic = str(rng.choice(RING_TACTICS, p=cfg.tactic_weights))
     k = int(rng.integers(cfg.ring_size_min, cfg.ring_size_max + 1))
 
-    # the compromised source is an established, ordinary-looking account
-    victim = int(rng.choice(pop["people"]))
+    # The compromised source is an established, ordinary-looking account -- and it
+    # must be unclaimed. Reusing an account that already belongs to another ring
+    # would overwrite its ring_id, which quietly moves a mule into a different
+    # split and leaks structure across the train/test boundary.
+    victim = _claim_free_account(w, pop, rng)
+    if victim is None:
+        return
     w.accounts[victim]["ring_role"] = "source"
     w.accounts[victim]["ring_id"] = ring_id
 

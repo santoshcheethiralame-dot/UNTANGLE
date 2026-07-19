@@ -71,6 +71,22 @@ def test_rented_mules_look_ordinary_on_profile(world):
     assert rented["device_share_count"].mean() < legit["device_share_count"].mean() + 0.5
 
 
+def test_each_account_belongs_to_at_most_one_ring(world):
+    """A ring must never recruit an account another ring already owns.
+
+    If it does, that account's ring_id is overwritten -- which moves it into a
+    different train/test split while its actual transaction structure still
+    belongs to the original ring. That is a silent cross-split leak, and it
+    inflates every graph-model score.
+    """
+    accounts, _ = world
+    claimed = accounts[accounts.ring_id >= 0]
+    assert (claimed["ring_role"] != "").all()
+    # a source is a victim, never a mule; a mule is never someone else's source
+    assert (accounts.loc[accounts.ring_role == "source", "is_mule"] == 0).all()
+    assert (accounts.loc[accounts.is_mule == 1, "ring_role"] != "source").all()
+
+
 def test_prevalence_is_realistic(world):
     accounts, _ = world
     assert 0.005 < accounts["is_mule"].mean() < 0.08

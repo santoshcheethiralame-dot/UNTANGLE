@@ -87,7 +87,8 @@ class RuleScorecard:
     def __init__(self, cfg: GraphConfig | None = None):
         self.cfg = cfg or GraphConfig()
 
-    def fit(self, X: pd.DataFrame, y: np.ndarray, mask: np.ndarray) -> "RuleScorecard":
+    def fit(self, X: pd.DataFrame, y: np.ndarray, mask: np.ndarray,
+            val_mask: np.ndarray | None = None) -> "RuleScorecard":
         return self  # nothing to fit -- that is the point of a rule engine
 
     def score(self, X: pd.DataFrame) -> np.ndarray:
@@ -121,7 +122,8 @@ class TabularModel:
             random_state=seed,
         )
 
-    def fit(self, X: pd.DataFrame, y: np.ndarray, mask: np.ndarray) -> "TabularModel":
+    def fit(self, X: pd.DataFrame, y: np.ndarray, mask: np.ndarray,
+            val_mask: np.ndarray | None = None) -> "TabularModel":
         self.clf.fit(X.to_numpy()[mask], y[mask])
         return self
 
